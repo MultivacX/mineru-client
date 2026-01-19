@@ -5,11 +5,11 @@ import subprocess
 import requests
 import shutil
 import shlex  # 新增：用于安全地拼接 shell 命令字符串
-from typing import Optional
+from typing import Optional, Literal
 from urllib.parse import quote, urlparse, unquote
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 
 # 添加项目根目录到路径
@@ -46,6 +46,53 @@ app = FastAPI(
 app.mount("/files", StaticFiles(directory=WORKSPACE_ROOT), name="files")
 
 
+class MinerUCommandParams(BaseModel):
+    """
+    MinerU 命令参数模型    
+    https://opendatalab.github.io/MinerU/zh/usage/cli_tools/
+    """
+    path: str = Field(..., description="输入文件路径或目录（必填）")
+    output: str = Field(..., description="输出目录（必填）")
+    backend: Literal[
+        "pipeline",
+        "hybrid-auto-engine",
+        "hybrid-http-client",
+        "vlm-auto-engine",
+        "vlm-http-client"
+    ] = Field(default="vlm-http-client", description="解析后端")
+    url: Optional[str] = Field(None, description="当使用 http-client 时，需指定服务地址")
+    lang: Optional[Literal[
+        "ch", "ch_server", "ch_lite", "en", "korean", "japan",
+        "chinese_cht", "ta", "te", "ka", "th", "el", "latin",
+        "arabic", "east_slavic", "cyrillic", "devanagari"
+    ]] = Field(None, description="指定文档语言（可提升 OCR 准确率，仅用于 pipeline 与 hybrid* 后端）")
+    formula: bool = Field(True, description="是否启用公式解析")
+    table: bool = Field(True, description="是否启用表格解析")
+    
+    def to_command_list(self) -> list[str]:
+        """将参数转换为命令行参数列表"""
+        cmd = [
+            'mineru',
+            '-p', self.path,
+            '-o', self.output,
+            '-b', self.backend
+        ]
+        
+        if self.url:
+            cmd.extend(['-u', self.url])
+        
+        if self.lang:
+            cmd.extend(['-l', self.lang])
+        
+        if not self.formula:
+            cmd.extend(['-f', 'false'])
+        
+        if not self.table:
+            cmd.extend(['-t', 'false'])
+        
+        return cmd
+
+
 class MinerURequest(BaseModel):
     """MinerU 请求模型"""
     pdf_url: Optional[str] = None
@@ -53,6 +100,9 @@ class MinerURequest(BaseModel):
     pdf_filename: Optional[str] = None
     vlm_url: Optional[str] = None
     backend: Optional[str] = None
+    lang: Optional[str] = None  # 文档语言
+    formula: Optional[bool] = None  # 是否启用公式解析
+    table: Optional[bool] = None  # 是否启用表格解析
 
 
 class MinerUResponse(BaseModel):
@@ -101,18 +151,18 @@ def download_pdf(pdf_url: str, save_path: str) -> bool:
         raise HTTPException(status_code=500, detail=f"下载 PDF 失败: {str(e)}")
 
 
-def run_mineru(input_path: str, output_path: str, vlm_url: str, backend: str) -> tuple[bool, str]:
+def run_mineru(params: MinerUCommandParams) -> tuple[bool, str]:
     """
     运行 mineru 命令处理 PDF
-    mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:30000
+    
+    Args:
+        params: MinerU 命令参数对象
+    
+    Returns:
+        (success, message): 执行结果
     """
-    cmd = [
-        'mineru',
-        '-p', input_path,
-        '-o', output_path,
-        '-b', backend,
-        '-u', vlm_url
-    ]
+    # 使用 MinerUCommandParams 的 to_command_list 方法生成命令
+    cmd = params.to_command_list()
     
     # 输出实际执行的 shell 脚本到日志
     # 使用 shlex.join 可以正确处理路径中的空格和特殊字符
@@ -212,7 +262,12 @@ def read_md_content(output_dir: str, input_filename: str) -> Optional[str]:
     return None
 
 
-def _process_pdf_task(temp_pdf_path: str, filename: str, vlm_url: str, backend: str, base_url: str) -> MinerUResponse:
+def _process_pdf_task(
+    temp_pdf_path: str, 
+    filename: str, 
+    base_url: str,
+    mineru_params: MinerUCommandParams
+) -> MinerUResponse:
     """
     核心处理逻辑：
     1. 计算 MD5
@@ -220,6 +275,12 @@ def _process_pdf_task(temp_pdf_path: str, filename: str, vlm_url: str, backend: 
     3. 检查是否已处理
     4. 运行 mineru
     5. 返回结果
+    
+    Args:
+        temp_pdf_path: 临时 PDF 文件路径
+        filename: 文件名
+        base_url: 下载基础 URL
+        mineru_params: MinerU 命令参数（注意：path 和 output 会被重新设置）
     """
     # 计算 MD5
     md5 = calculate_file_md5(temp_pdf_path)
@@ -269,8 +330,12 @@ def _process_pdf_task(temp_pdf_path: str, filename: str, vlm_url: str, backend: 
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     
+    # 更新 mineru 参数中的路径
+    mineru_params.path = input_pdf_path
+    mineru_params.output = output_dir
+    
     # 运行 mineru
-    success, message = run_mineru(input_pdf_path, output_dir, vlm_url, backend)
+    success, message = run_mineru(mineru_params)
     
     if not success:
         return MinerUResponse(
@@ -337,9 +402,6 @@ async def mineru_endpoint(body: MinerURequest, request: Request):
     if body.pdf_url and body.pdf_path:
         raise HTTPException(status_code=400, detail="只能提供 pdf_url 或 pdf_path 其中一个")
     
-    vlm_url = body.vlm_url or MINERU_VLM_URL
-    backend = body.backend or MINERU_BACKEND
-    
     # 创建临时目录
     temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
     os.makedirs(temp_dir, exist_ok=True)
@@ -365,7 +427,18 @@ async def mineru_endpoint(body: MinerURequest, request: Request):
         # 下载 PDF
         download_pdf(body.pdf_url, temp_pdf_path)
     
-    return _process_pdf_task(temp_pdf_path, filename, vlm_url, backend, base_url)
+    # 创建 MinerU 命令参数
+    mineru_params = MinerUCommandParams(
+        path="",  # 将在 _process_pdf_task 中设置
+        output="",  # 将在 _process_pdf_task 中设置
+        backend=body.backend or MINERU_BACKEND,
+        url=body.vlm_url or MINERU_VLM_URL,
+        lang=body.lang,
+        formula=body.formula if body.formula is not None else True,
+        table=body.table if body.table is not None else True
+    )
+    
+    return _process_pdf_task(temp_pdf_path, filename, base_url, mineru_params)
 
 
 @app.post("/file_mineru", response_model=MinerUResponse)
@@ -374,7 +447,10 @@ async def file_mineru_endpoint(
     file: UploadFile = File(..., description="PDF 文件"),
     pdf_filename: Optional[str] = Form(None, description="指定保存时的文件名"),
     vlm_url: Optional[str] = Form(None, description="VLM 服务地址"),
-    backend: Optional[str] = Form(None, description="MinerU 后端类型")
+    backend: Optional[str] = Form(None, description="MinerU 后端类型"),
+    lang: Optional[str] = Form(None, description="文档语言"),
+    formula: Optional[bool] = Form(None, description="是否启用公式解析"),
+    table: Optional[bool] = Form(None, description="是否启用表格解析")
 ):
     """
     通过文件上传方式处理 PDF
@@ -393,8 +469,6 @@ async def file_mineru_endpoint(
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="只支持 PDF 文件")
 
-    vlm_url = vlm_url or MINERU_VLM_URL
-    backend = backend or MINERU_BACKEND
     filename = pdf_filename or file.filename
 
     # 创建临时目录
@@ -412,7 +486,18 @@ async def file_mineru_endpoint(
     finally:
         file.file.close()
     
-    return _process_pdf_task(temp_pdf_path, filename, vlm_url, backend, base_url)
+    # 创建 MinerU 命令参数
+    mineru_params = MinerUCommandParams(
+        path="",  # 将在 _process_pdf_task 中设置
+        output="",  # 将在 _process_pdf_task 中设置
+        backend=backend or MINERU_BACKEND,
+        url=vlm_url or MINERU_VLM_URL,
+        lang=lang,
+        formula=formula if formula is not None else True,
+        table=table if table is not None else True
+    )
+    
+    return _process_pdf_task(temp_pdf_path, filename, base_url, mineru_params)
 
 
 @app.get("/status/{md5}")
