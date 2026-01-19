@@ -5,8 +5,10 @@ import subprocess
 import requests
 import shutil
 import shlex  # 新增：用于安全地拼接 shell 命令字符串
+import uuid
 from typing import Optional, Literal
 from urllib.parse import quote, urlparse, unquote
+from filelock import FileLock, Timeout
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -24,6 +26,10 @@ WORKSPACE_OUTPUT = os.path.join(WORKSPACE_ROOT, 'output')
 # 确保工作目录存在
 os.makedirs(WORKSPACE_INPUT, exist_ok=True)
 os.makedirs(WORKSPACE_OUTPUT, exist_ok=True)
+
+# 文件锁目录
+WORKSPACE_LOCKS = os.path.join(WORKSPACE_ROOT, 'locks')
+os.makedirs(WORKSPACE_LOCKS, exist_ok=True)
 
 # mineru 配置
 MINERU_VLM_URL = os.environ.get('MINERU_VLM_URL', 'http://10.104.255.37:30010')
@@ -127,6 +133,40 @@ def calculate_file_md5(file_path: str) -> str:
     return md5_hash.hexdigest()
 
 
+def get_lock_for_md5(md5: str) -> FileLock:
+    """为指定的 MD5 获取文件锁"""
+    lock_file = os.path.join(WORKSPACE_LOCKS, f"{md5}.lock")
+    return FileLock(lock_file, timeout=300)  # 5分钟超时
+
+
+def save_original_filename(input_dir: str, original_filename: str):
+    """保存原始文件名到 filename.txt"""
+    filename_file = os.path.join(input_dir, 'filename.txt')
+    # 如果文件已存在，追加新文件名（避免覆盖）
+    mode = 'a' if os.path.exists(filename_file) else 'w'
+    with open(filename_file, mode, encoding='utf-8') as f:
+        # 检查是否已记录过该文件名
+        if mode == 'a':
+            with open(filename_file, 'r', encoding='utf-8') as rf:
+                existing_names = rf.read().strip().split('\n')
+                if original_filename in existing_names:
+                    return
+        f.write(original_filename + '\n')
+
+
+def get_original_filename(input_dir: str) -> Optional[str]:
+    """读取原始文件名（返回第一个记录的文件名）"""
+    filename_file = os.path.join(input_dir, 'filename.txt')
+    if os.path.exists(filename_file):
+        try:
+            with open(filename_file, 'r', encoding='utf-8') as f:
+                first_line = f.readline().strip()
+                return first_line if first_line else None
+        except Exception as e:
+            print(f"读取 filename.txt 失败: {str(e)}")
+    return None
+
+
 def get_filename_from_url(pdf_url: str) -> str:
     """从 URL 中提取文件名"""
     parsed = urlparse(pdf_url)
@@ -215,21 +255,17 @@ def generate_download_urls(md5: str, files: list, base_url: str) -> dict:
     return urls
 
 
-def read_md_content(output_dir: str, input_filename: str) -> Optional[str]:
+def read_md_content(output_dir: str, md5: str) -> Optional[str]:
     """
     读取 markdown 文件内容并返回。
-    优先级：
-    1. 查找与输入文件同名的 md 文件（不含扩展名）
-    2. 如果没找到同名文件，返回找到的第一个 .md 文件（针对不同文件名处理同一内容的情况）
+    统一查找 {md5}.md 文件，如果找不到则返回第一个找到的 .md 文件。
     """
     if not os.path.exists(output_dir):
         return None
     
-    # 尝试查找与输入文件同名的 md 文件（不含扩展名）
-    base_name = os.path.splitext(input_filename)[0]
-    target_md = f"{base_name}.md"
-    
-    first_md_path = None # 用于存放找到的第一个 md 文件路径，用于兜底
+    # 优先查找以 md5 命名的 md 文件
+    target_md = f"{md5}.md"
+    first_md_path = None
 
     for root, _, filenames in os.walk(output_dir):
         for filename in filenames:
@@ -240,18 +276,16 @@ def read_md_content(output_dir: str, input_filename: str) -> Optional[str]:
                 if first_md_path is None:
                     first_md_path = file_path
 
-                # 优先匹配同名文件
+                # 优先匹配 md5 命名的文件
                 if filename == target_md:
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             return f.read()
                     except Exception as e:
                         print(f"读取文件 {file_path} 失败: {str(e)}")
-                        # 即使读取失败，也可以尝试使用第一个 md 文件
                         pass
 
-    # 如果没找到同名的，但找到了其他的 md 文件，则返回第一个找到的
-    # 这是为了修复：已处理过的文件，如果传入其他的 filename，导致没有 .md 内容的问题
+    # 如果没找到 md5.md，返回第一个找到的 md 文件
     if first_md_path:
         try:
             with open(first_md_path, 'r', encoding='utf-8') as f:
@@ -269,101 +303,130 @@ def _process_pdf_task(
     mineru_params: MinerUCommandParams
 ) -> MinerUResponse:
     """
-    核心处理逻辑：
+    核心处理逻辑（带并发保护）：
     1. 计算 MD5
-    2. 移动文件到正式目录
-    3. 检查是否已处理
-    4. 运行 mineru
-    5. 返回结果
+    2. 获取文件锁（防止并发处理同一文件）
+    3. 移动文件到正式目录（统一使用 md5.pdf 命名）
+    4. 检查是否已处理
+    5. 运行 mineru
+    6. 返回结果
     
     Args:
         temp_pdf_path: 临时 PDF 文件路径
-        filename: 文件名
+        filename: 原始文件名（用于记录）
         base_url: 下载基础 URL
         mineru_params: MinerU 命令参数（注意：path 和 output 会被重新设置）
     """
     # 计算 MD5
     md5 = calculate_file_md5(temp_pdf_path)
     
-    # 创建基于 MD5 的输入目录
-    input_dir = os.path.join(WORKSPACE_INPUT, md5)
-    os.makedirs(input_dir, exist_ok=True)
+    # 获取文件锁，防止并发处理同一个 MD5
+    lock = get_lock_for_md5(md5)
     
-    # 移动文件到正式目录
-    input_pdf_path = os.path.join(input_dir, filename)
-    if os.path.exists(input_pdf_path):
-        os.remove(temp_pdf_path)  # 文件已存在，删除临时文件
-    else:
-        os.rename(temp_pdf_path, input_pdf_path)
-    
-    # 输出目录
-    output_dir = os.path.join(WORKSPACE_OUTPUT, md5)
-    
-    # 检查是否已处理过（输出目录存在且有文件）
-    # 判断是否存在 .md 文件，避免部分处理失败的情况
-    is_cached = False
-    if os.path.exists(output_dir) and any(
-        f.endswith('.md') 
-        for root, dirs, files in os.walk(output_dir) 
-        for f in files
-    ):
-        is_cached = True
+    try:
+        with lock:
+            # 创建基于 MD5 的输入目录
+            input_dir = os.path.join(WORKSPACE_INPUT, md5)
+            os.makedirs(input_dir, exist_ok=True)
+            
+            # 统一使用 md5.pdf 作为文件名
+            input_pdf_path = os.path.join(input_dir, f"{md5}.pdf")
+            
+            # 保存原始文件名
+            save_original_filename(input_dir, filename)
+            
+            # 移动文件到正式目录
+            if os.path.exists(input_pdf_path):
+                os.remove(temp_pdf_path)  # 文件已存在，删除临时文件
+            else:
+                os.rename(temp_pdf_path, input_pdf_path)
+            
+            # 输出目录
+            output_dir = os.path.join(WORKSPACE_OUTPUT, md5)
+            
+            # 检查是否已处理过（输出目录存在且有 .md 文件）
+            is_cached = False
+            if os.path.exists(output_dir) and any(
+                f.endswith('.md') 
+                for root, dirs, files in os.walk(output_dir) 
+                for f in files
+            ):
+                is_cached = True
 
-    if is_cached:
-        files = get_output_files(output_dir)
-        download_urls = generate_download_urls(md5, files, base_url)
-        md_content = read_md_content(output_dir, filename)
-        
-        response = MinerUResponse(
-            success=True,
-            message="文件已处理过，直接返回结果",
-            md5=md5,
-            input_path=input_pdf_path,
-            output_path=output_dir,
-            files=files,
-            download_urls=download_urls
+            if is_cached:
+                files = get_output_files(output_dir)
+                download_urls = generate_download_urls(md5, files, base_url)
+                md_content = read_md_content(output_dir, md5)
+                
+                # 获取原始文件名用于日志
+                original_filename = get_original_filename(input_dir) or filename
+                
+                response = MinerUResponse(
+                    success=True,
+                    message=f"文件已处理过，直接返回结果（原始文件名: {original_filename}）",
+                    md5=md5,
+                    input_path=input_pdf_path,
+                    output_path=output_dir,
+                    files=files,
+                    download_urls=download_urls
+                )
+                # 统一使用 md5.md 作为动态字段名
+                if md_content:
+                    setattr(response, f"{md5}.md", md_content)
+                return response
+            
+            # 创建输出目录
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 更新 mineru 参数中的路径
+            mineru_params.path = input_pdf_path
+            mineru_params.output = output_dir
+            
+            # 运行 mineru
+            print(f"[MinerU] 开始处理文件: {filename} (MD5: {md5})")
+            success, message = run_mineru(mineru_params)
+            
+            if not success:
+                return MinerUResponse(
+                    success=False,
+                    message=message,
+                    md5=md5,
+                    input_path=input_pdf_path,
+                    output_path=output_dir
+                )
+            
+            # 获取输出文件列表
+            files = get_output_files(output_dir)
+            download_urls = generate_download_urls(md5, files, base_url)
+            md_content = read_md_content(output_dir, md5)
+            
+            response = MinerUResponse(
+                success=True,
+                message=f"处理成功（原始文件名: {filename}）",
+                md5=md5,
+                input_path=input_pdf_path,
+                output_path=output_dir,
+                files=files,
+                download_urls=download_urls
+            )
+            # 统一使用 md5.md 作为动态字段名
+            if md_content:
+                setattr(response, f"{md5}.md", md_content)
+            return response
+            
+    except Timeout:
+        # 清理临时文件
+        if os.path.exists(temp_pdf_path):
+            os.remove(temp_pdf_path)
+        raise HTTPException(
+            status_code=409, 
+            detail=f"文件正在被其他请求处理，请稍后重试（MD5: {md5}）"
         )
-        if md_content:
-            setattr(response, md5 + ".md" if not filename else os.path.splitext(filename)[0] + ".md", md_content)
-        return response
-    
-    # 创建输出目录
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 更新 mineru 参数中的路径
-    mineru_params.path = input_pdf_path
-    mineru_params.output = output_dir
-    
-    # 运行 mineru
-    success, message = run_mineru(mineru_params)
-    
-    if not success:
-        return MinerUResponse(
-            success=False,
-            message=message,
-            md5=md5,
-            input_path=input_pdf_path,
-            output_path=output_dir
-        )
-    
-    # 获取输出文件列表
-    files = get_output_files(output_dir)
-    download_urls = generate_download_urls(md5, files, base_url)
-    md_content = read_md_content(output_dir, filename)
-    
-    response = MinerUResponse(
-        success=True,
-        message="处理成功",
-        md5=md5,
-        input_path=input_pdf_path,
-        output_path=output_dir,
-        files=files,
-        download_urls=download_urls
-    )
-    # 将 md 内容作为动态字段添加
-    if md_content:
-        setattr(response, md5 + ".md" if not filename else os.path.splitext(filename)[0] + ".md", md_content)
-    return response
+    except Exception as e:
+        # 清理临时文件
+        if os.path.exists(temp_pdf_path):
+            os.remove(temp_pdf_path)
+        raise
 
 
 @app.get("/")
@@ -406,6 +469,10 @@ async def mineru_endpoint(body: MinerURequest, request: Request):
     temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
     os.makedirs(temp_dir, exist_ok=True)
     
+    # 生成唯一的临时文件名，避免并发冲突
+    temp_filename = f"{uuid.uuid4().hex}.pdf"
+    temp_pdf_path = os.path.join(temp_dir, temp_filename)
+    
     # 处理本地文件路径
     if body.pdf_path:
         if not os.path.exists(body.pdf_path):
@@ -415,14 +482,12 @@ async def mineru_endpoint(body: MinerURequest, request: Request):
             raise HTTPException(status_code=400, detail="只支持 PDF 文件")
         
         filename = body.pdf_filename or os.path.basename(body.pdf_path)
-        temp_pdf_path = os.path.join(temp_dir, filename)
         
         # 复制文件到临时目录
         shutil.copy2(body.pdf_path, temp_pdf_path)
     else:
         # 处理 URL 下载
         filename = body.pdf_filename or get_filename_from_url(body.pdf_url)
-        temp_pdf_path = os.path.join(temp_dir, filename)
         
         # 下载 PDF
         download_pdf(body.pdf_url, temp_pdf_path)
@@ -475,7 +540,9 @@ async def file_mineru_endpoint(
     temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
     os.makedirs(temp_dir, exist_ok=True)
     
-    temp_pdf_path = os.path.join(temp_dir, filename)
+    # 使用 UUID 生成唯一的临时文件名，避免并发冲突
+    temp_filename = f"{uuid.uuid4().hex}.pdf"
+    temp_pdf_path = os.path.join(temp_dir, temp_filename)
     
     try:
         # 保存上传的文件
