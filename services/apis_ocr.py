@@ -8,6 +8,11 @@ import shlex  # 新增：用于安全地拼接 shell 命令字符串
 import uuid
 import json
 import fitz  # PyMuPDF
+import asyncio
+import logging
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import Optional, Literal, Dict
 from urllib.parse import quote, urlparse, unquote
 from filelock import FileLock, Timeout
@@ -43,6 +48,20 @@ SERVER_PORT = int(os.environ.get('OCR_SERVER_PORT', '8081'))
 # DOWNLOAD_BASE_URL 将从请求中动态获取，这里保留环境变量作为 fallback
 DOWNLOAD_BASE_URL = os.environ.get('OCR_DOWNLOAD_BASE_URL', None)
 
+# 线程池配置
+MAX_WORKERS = 30  # 最大并发线程数
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(WORKSPACE_ROOT, 'ocr_service.log'), encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # API Key 鉴权配置（支持多用户）
 # 方式1: OCR_API_KEYS - JSON 格式字典 {"user1": "key1", "user2": "key2"}
 # 方式2: OCR_API_KEY - 单个 key（向后兼容）
@@ -61,11 +80,30 @@ elif os.environ.get('OCR_API_KEY', None):
     # 向后兼容单个 API key
     API_KEYS[os.environ.get('OCR_API_KEY')] = 'default'
 
+# 线程池执行器（全局变量，在 lifespan 中初始化）
+executor: Optional[ThreadPoolExecutor] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    global executor
+    # 启动时创建线程池
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    print(f"[启动] 线程池已创建，最大并发数: {MAX_WORKERS}")
+    yield
+    # 关闭时清理线程池
+    if executor:
+        executor.shutdown(wait=True)
+        print("[关闭] 线程池已关闭")
+
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title="MinerU OCR 服务",
     description="使用 MinerU 将 PDF 转换为 Markdown",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # 挂载静态文件服务
@@ -299,15 +337,21 @@ def get_filename_from_url(pdf_url: str) -> str:
 def download_pdf(pdf_url: str, save_path: str) -> bool:
     """下载 PDF 文件到指定路径"""
     try:
+        logger.info(f"开始下载 PDF: {pdf_url}")
         response = requests.get(pdf_url, stream=True, timeout=300)
         response.raise_for_status()
         
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+        logger.info(f"PDF 下载成功: {pdf_url} -> {save_path}")
         return True
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
+        logger.error(f"下载 PDF 失败 - URL: {pdf_url}, 错误: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"下载 PDF 失败: {str(e)}")
+    except Exception as e:
+        logger.error(f"保存 PDF 文件失败 - 路径: {save_path}, 错误: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存 PDF 失败: {str(e)}")
 
 
 def run_mineru(params: MinerUCommandParams) -> tuple[bool, str]:
@@ -337,15 +381,24 @@ def run_mineru(params: MinerUCommandParams) -> tuple[bool, str]:
         )
         
         if result.returncode == 0:
+            logger.info(f"MinerU 执行成功: {params.path}")
             return True, result.stdout
         else:
-            return False, f"mineru 执行失败: {result.stderr}"
+            error_msg = f"mineru 执行失败: {result.stderr}"
+            logger.error(f"MinerU 执行失败 - 命令: {cmd_script}, 返回码: {result.returncode}, 错误: {result.stderr}")
+            return False, error_msg
     except subprocess.TimeoutExpired:
-        return False, "mineru 执行超时"
+        error_msg = "mineru 执行超时（30分钟）"
+        logger.error(f"MinerU 执行超时 - 命令: {cmd_script}, 文件: {params.path}")
+        return False, error_msg
     except FileNotFoundError:
-        return False, "mineru 命令未找到，请确保已安装 MinerU"
+        error_msg = "mineru 命令未找到，请确保已安装 MinerU"
+        logger.error(f"MinerU 命令未找到 - 命令: {cmd_script}")
+        return False, error_msg
     except Exception as e:
-        return False, f"执行 mineru 时发生错误: {str(e)}"
+        error_msg = f"执行 mineru 时发生错误: {str(e)}"
+        logger.error(f"MinerU 执行异常 - 命令: {cmd_script}, 错误: {str(e)}", exc_info=True)
+        return False, error_msg
 
 
 def get_output_files(output_dir: str) -> list:
@@ -539,15 +592,19 @@ def _process_pdf_task(
         # 清理临时文件
         if os.path.exists(temp_pdf_path):
             os.remove(temp_pdf_path)
-        raise HTTPException(
-            status_code=409, 
-            detail=f"文件正在被其他请求处理，请稍后重试（MD5: {md5}）"
-        )
+        error_msg = f"文件正在被其他请求处理，请稍后重试（MD5: {md5}）"
+        logger.warning(f"文件锁超时 - MD5: {md5}, 文件名: {filename}")
+        raise HTTPException(status_code=409, detail=error_msg)
+    except HTTPException:
+        # 重新抛出 HTTP 异常
+        raise
     except Exception as e:
         # 清理临时文件
         if os.path.exists(temp_pdf_path):
             os.remove(temp_pdf_path)
-        raise
+        error_msg = f"处理 PDF 任务时发生错误: {str(e)}"
+        logger.error(f"处理 PDF 任务异常 - MD5: {md5}, 文件名: {filename}, 错误: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.get("/")
@@ -583,57 +640,84 @@ async def mineru_endpoint(
     # 获取客户端 IP
     client_ip = get_client_ip(request)
     user_info = f"User: {api_key}" if api_key else "No Auth"
-    print(f"[API Request] /mineru - {user_info}, IP: {client_ip}")
+    logger.info(f"[API Request] /mineru - {user_info}, IP: {client_ip}, Body: pdf_url={body.pdf_url}, pdf_path={body.pdf_path}")
     
     # 获取请求的 base_url
     base_url = DOWNLOAD_BASE_URL or str(request.base_url).rstrip('/')
     
     # 验证参数
     if not body.pdf_url and not body.pdf_path:
+        logger.warning(f"[API Request] /mineru - 参数错误: 缺少 pdf_url 或 pdf_path, IP: {client_ip}")
         raise HTTPException(status_code=400, detail="必须提供 pdf_url 或 pdf_path")
     
     if body.pdf_url and body.pdf_path:
+        logger.warning(f"[API Request] /mineru - 参数错误: 同时提供了 pdf_url 和 pdf_path, IP: {client_ip}")
         raise HTTPException(status_code=400, detail="只能提供 pdf_url 或 pdf_path 其中一个")
     
-    # 创建临时目录
-    temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # 生成唯一的临时文件名，避免并发冲突
-    temp_filename = f"{uuid.uuid4().hex}.pdf"
-    temp_pdf_path = os.path.join(temp_dir, temp_filename)
-    
-    # 处理本地文件路径
-    if body.pdf_path:
-        if not os.path.exists(body.pdf_path):
-            raise HTTPException(status_code=404, detail=f"文件不存在: {body.pdf_path}")
+    try:
+        # 创建临时目录
+        temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
+        os.makedirs(temp_dir, exist_ok=True)
         
-        if not body.pdf_path.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="只支持 PDF 文件")
+        # 生成唯一的临时文件名，避免并发冲突
+        temp_filename = f"{uuid.uuid4().hex}.pdf"
+        temp_pdf_path = os.path.join(temp_dir, temp_filename)
         
-        filename = body.pdf_filename or os.path.basename(body.pdf_path)
+        # 处理本地文件路径
+        if body.pdf_path:
+            if not os.path.exists(body.pdf_path):
+                logger.error(f"[API Request] /mineru - 文件不存在: {body.pdf_path}, IP: {client_ip}")
+                raise HTTPException(status_code=404, detail=f"文件不存在: {body.pdf_path}")
+            
+            if not body.pdf_path.lower().endswith('.pdf'):
+                logger.warning(f"[API Request] /mineru - 文件类型错误: {body.pdf_path}, IP: {client_ip}")
+                raise HTTPException(status_code=400, detail="只支持 PDF 文件")
+            
+            filename = body.pdf_filename or os.path.basename(body.pdf_path)
+            
+            # 复制文件到临时目录
+            try:
+                shutil.copy2(body.pdf_path, temp_pdf_path)
+                logger.info(f"本地文件复制成功: {body.pdf_path} -> {temp_pdf_path}")
+            except Exception as e:
+                logger.error(f"复制本地文件失败 - 源: {body.pdf_path}, 目标: {temp_pdf_path}, 错误: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
+        else:
+            # 处理 URL 下载
+            filename = body.pdf_filename or get_filename_from_url(body.pdf_url)
+            
+            # 下载 PDF
+            download_pdf(body.pdf_url, temp_pdf_path)
         
-        # 复制文件到临时目录
-        shutil.copy2(body.pdf_path, temp_pdf_path)
-    else:
-        # 处理 URL 下载
-        filename = body.pdf_filename or get_filename_from_url(body.pdf_url)
+        # 创建 MinerU 命令参数
+        mineru_params = MinerUCommandParams(
+            path="",  # 将在 _process_pdf_task 中设置
+            output="",  # 将在 _process_pdf_task 中设置
+            backend=body.backend or MINERU_BACKEND,
+            url=body.vlm_url or MINERU_VLM_URL,
+            lang=body.lang,
+            formula=body.formula if body.formula is not None else True,
+            table=body.table if body.table is not None else True
+        )
         
-        # 下载 PDF
-        download_pdf(body.pdf_url, temp_pdf_path)
-    
-    # 创建 MinerU 命令参数
-    mineru_params = MinerUCommandParams(
-        path="",  # 将在 _process_pdf_task 中设置
-        output="",  # 将在 _process_pdf_task 中设置
-        backend=body.backend or MINERU_BACKEND,
-        url=body.vlm_url or MINERU_VLM_URL,
-        lang=body.lang,
-        formula=body.formula if body.formula is not None else True,
-        table=body.table if body.table is not None else True
-    )
-    
-    return _process_pdf_task(temp_pdf_path, filename, base_url, mineru_params)
+        # 使用线程池异步执行处理任务
+        logger.info(f"提交处理任务到线程池 - 文件: {filename}, IP: {client_ip}")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            _process_pdf_task,
+            temp_pdf_path,
+            filename,
+            base_url,
+            mineru_params
+        )
+        logger.info(f"处理任务完成 - 文件: {filename}, MD5: {result.md5}, 成功: {result.success}, IP: {client_ip}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API Request] /mineru - 未预期错误, IP: {client_ip}, 错误: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"处理请求时发生错误: {str(e)}")
 
 
 @app.post("/file_mineru", response_model=MinerUResponse)
@@ -659,48 +743,71 @@ async def file_mineru_endpoint(
     # 获取客户端 IP
     client_ip = get_client_ip(request)
     user_info = f"User: {api_key}" if api_key else "No Auth"
-    print(f"[API Request] /file_mineru - {user_info}, IP: {client_ip}, File: {file.filename}")
+    logger.info(f"[API Request] /file_mineru - {user_info}, IP: {client_ip}, File: {file.filename}")
     
     base_url = DOWNLOAD_BASE_URL or str(request.base_url).rstrip('/')
     
     # 验证文件类型
     if not file.filename:
+        logger.warning(f"[API Request] /file_mineru - 未提供文件, IP: {client_ip}")
         raise HTTPException(status_code=400, detail="未提供文件")
     
     if not file.filename.lower().endswith('.pdf'):
+        logger.warning(f"[API Request] /file_mineru - 文件类型错误: {file.filename}, IP: {client_ip}")
         raise HTTPException(status_code=400, detail="只支持 PDF 文件")
 
     filename = pdf_filename or file.filename
 
-    # 创建临时目录
-    temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # 使用 UUID 生成唯一的临时文件名，避免并发冲突
-    temp_filename = f"{uuid.uuid4().hex}.pdf"
-    temp_pdf_path = os.path.join(temp_dir, temp_filename)
-    
     try:
-        # 保存上传的文件
-        with open(temp_pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # 创建临时目录
+        temp_dir = os.path.join(WORKSPACE_INPUT, 'temp')
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # 使用 UUID 生成唯一的临时文件名，避免并发冲突
+        temp_filename = f"{uuid.uuid4().hex}.pdf"
+        temp_pdf_path = os.path.join(temp_dir, temp_filename)
+        
+        try:
+            # 保存上传的文件
+            logger.info(f"开始保存上传文件: {filename} -> {temp_pdf_path}")
+            with open(temp_pdf_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            logger.info(f"文件保存成功: {temp_pdf_path}")
+        except Exception as e:
+            logger.error(f"保存上传文件失败 - 文件: {filename}, 路径: {temp_pdf_path}, 错误: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"保存文件失败: {str(e)}")
+        finally:
+            file.file.close()
+    
+        # 创建 MinerU 命令参数
+        mineru_params = MinerUCommandParams(
+            path="",  # 将在 _process_pdf_task 中设置
+            output="",  # 将在 _process_pdf_task 中设置
+            backend=backend or MINERU_BACKEND,
+            url=vlm_url or MINERU_VLM_URL,
+            lang=lang,
+            formula=formula if formula is not None else True,
+            table=table if table is not None else True
+        )
+        
+        # 使用线程池异步执行处理任务
+        logger.info(f"提交处理任务到线程池 - 文件: {filename}, IP: {client_ip}")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            _process_pdf_task,
+            temp_pdf_path,
+            filename,
+            base_url,
+            mineru_params
+        )
+        logger.info(f"处理任务完成 - 文件: {filename}, MD5: {result.md5}, 成功: {result.success}, IP: {client_ip}")
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"保存文件失败: {str(e)}")
-    finally:
-        file.file.close()
-    
-    # 创建 MinerU 命令参数
-    mineru_params = MinerUCommandParams(
-        path="",  # 将在 _process_pdf_task 中设置
-        output="",  # 将在 _process_pdf_task 中设置
-        backend=backend or MINERU_BACKEND,
-        url=vlm_url or MINERU_VLM_URL,
-        lang=lang,
-        formula=formula if formula is not None else True,
-        table=table if table is not None else True
-    )
-    
-    return _process_pdf_task(temp_pdf_path, filename, base_url, mineru_params)
+        logger.error(f"[API Request] /file_mineru - 未预期错误, IP: {client_ip}, 文件: {file.filename}, 错误: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"处理请求时发生错误: {str(e)}")
 
 
 @app.get("/status/{md5}")
