@@ -49,7 +49,25 @@ curl -X POST "http://localhost:8081/mineru" \
   }'
 ```
 
-6. 调用方式
+6. API Key 配置（可选）
+```sh
+# 方式1：配置多个用户的 API Key（推荐）
+export OCR_API_KEYS='{
+  "user1": "key_abc123",
+  "user2": "key_xyz789",
+  "admin": "key_admin456"
+}'
+
+# 方式2：配置单个 API Key（向后兼容）
+export OCR_API_KEY="your-secret-key"
+
+# 如果不设置以上环境变量，则不启用鉴权
+```
+
+7. 调用方式
+
+**基础调用示例（未启用鉴权）**
+
 - 通过文件 URL 处理
 ```sh
 curl -X POST "http://localhost:8081/mineru" \
@@ -59,6 +77,8 @@ curl -X POST "http://localhost:8081/mineru" \
    }'
 ```
 ```python
+import requests
+
 response = requests.post(
     'http://localhost:8081/mineru',
     json={'pdf_url': 'https://example.com/sample.pdf'}
@@ -74,8 +94,113 @@ curl -X POST "http://localhost:8081/mineru" \
    }'
 ```
 ```python
+import requests
+
 response = requests.post(
     'http://localhost:8081/mineru',
     json={'pdf_path': '/path/to/local/document.pdf'}
 )
+```
+
+- 通过文件上传处理
+```sh
+curl -X POST "http://localhost:8081/file_mineru" \
+   -F "file=@/path/to/local/document.pdf" \
+   -F "pdf_filename=custom_name.pdf"
+```
+```python
+import requests
+
+with open('/path/to/local/document.pdf', 'rb') as f:
+    response = requests.post(
+        'http://localhost:8081/file_mineru',
+        files={'file': f},
+        data={'pdf_filename': 'custom_name.pdf'}
+    )
+```
+
+**带 Bearer Token 鉴权的调用示例（启用鉴权后）**
+
+- 通过文件 URL 处理
+```sh
+curl -X POST "http://localhost:8081/mineru" \
+   -H "Authorization: Bearer key_abc123" \
+   -H "Content-Type: application/json" \
+   -d '{
+     "pdf_url": "https://example.com/sample.pdf"
+   }'
+```
+```python
+import requests
+
+headers = {
+    'Authorization': 'Bearer key_abc123'
+}
+
+response = requests.post(
+    'http://localhost:8081/mineru',
+    headers=headers,
+    json={'pdf_url': 'https://example.com/sample.pdf'}
+)
+```
+
+- 在服务器上处理本地文件
+```sh
+curl -X POST "http://localhost:8081/mineru" \
+   -H "Authorization: Bearer key_abc123" \
+   -H "Content-Type: application/json" \
+   -d '{
+     "pdf_path": "/xxx/document.pdf"
+   }'
+```
+```python
+import requests
+
+headers = {
+    'Authorization': 'Bearer key_abc123'
+}
+
+response = requests.post(
+    'http://localhost:8081/mineru',
+    headers=headers,
+    json={'pdf_path': '/path/to/local/document.pdf'}
+)
+```
+
+- 通过文件上传处理
+```sh
+curl -X POST "http://localhost:8081/file_mineru" \
+   -H "Authorization: Bearer key_abc123" \
+   -F "file=@/path/to/local/document.pdf" \
+   -F "pdf_filename=custom_name.pdf"
+```
+```python
+import requests
+
+headers = {
+    'Authorization': 'Bearer key_abc123'
+}
+
+with open('/path/to/local/document.pdf', 'rb') as f:
+    response = requests.post(
+        'http://localhost:8081/file_mineru',
+        headers=headers,
+        files={'file': f},
+        data={'pdf_filename': 'custom_name.pdf'}
+    )
+```
+
+**高级参数配置**
+```sh
+curl -X POST "http://localhost:8081/mineru" \
+   -H "Authorization: Bearer key_abc123" \
+   -H "Content-Type: application/json" \
+   -d '{
+     "pdf_url": "https://example.com/sample.pdf",
+     "vlm_url": "http://custom-vlm:30010",
+     "backend": "vlm-http-client",
+     "lang": "en",
+     "formula": true,
+     "table": true
+   }'
 ```

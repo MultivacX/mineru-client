@@ -6,10 +6,12 @@ import requests
 import shutil
 import shlex  # 新增：用于安全地拼接 shell 命令字符串
 import uuid
-from typing import Optional, Literal
+import json
+import fitz  # PyMuPDF
+from typing import Optional, Literal, Dict
 from urllib.parse import quote, urlparse, unquote
 from filelock import FileLock, Timeout
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form, Header, Depends
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
@@ -40,6 +42,24 @@ SERVER_HOST = os.environ.get('OCR_SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.environ.get('OCR_SERVER_PORT', '8081'))
 # DOWNLOAD_BASE_URL 将从请求中动态获取，这里保留环境变量作为 fallback
 DOWNLOAD_BASE_URL = os.environ.get('OCR_DOWNLOAD_BASE_URL', None)
+
+# API Key 鉴权配置（支持多用户）
+# 方式1: OCR_API_KEYS - JSON 格式字典 {"user1": "key1", "user2": "key2"}
+# 方式2: OCR_API_KEY - 单个 key（向后兼容）
+API_KEYS: Dict[str, str] = {}  # key -> user_id 的映射
+
+api_keys_json = os.environ.get('OCR_API_KEYS', None)
+if api_keys_json:
+    try:
+        # 支持 JSON 格式: {"user1": "key1", "user2": "key2"}
+        user_keys = json.loads(api_keys_json)
+        # 反转映射：从 user->key 转为 key->user
+        API_KEYS = {key: user for user, key in user_keys.items()}
+    except json.JSONDecodeError:
+        print(f"警告: OCR_API_KEYS 格式错误，应为 JSON 格式")
+elif os.environ.get('OCR_API_KEY', None):
+    # 向后兼容单个 API key
+    API_KEYS[os.environ.get('OCR_API_KEY')] = 'default'
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -131,6 +151,105 @@ def calculate_file_md5(file_path: str) -> str:
         for chunk in iter(lambda: f.read(8192), b''):
             md5_hash.update(chunk)
     return md5_hash.hexdigest()
+
+
+def get_pdf_page_count(pdf_path: str) -> int:
+    """
+    使用 fitz (PyMuPDF) 计算 PDF 页数
+    
+    Args:
+        pdf_path: PDF 文件路径
+    
+    Returns:
+        PDF 文件的页数
+    
+    Raises:
+        Exception: 如果无法打开或读取 PDF 文件
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        page_count = doc.page_count
+        doc.close()
+        return page_count
+    except Exception as e:
+        # raise Exception(f"无法计算 PDF 页数: {str(e)}")
+        print(f"无法计算 PDF 页数: {pdf_path} {str(e)}")
+    return 0
+
+
+def get_client_ip(request: Request) -> str:
+    """
+    获取客户端真实 IP 地址
+    优先从代理头中获取，如果没有则使用直连 IP
+    
+    Args:
+        request: FastAPI Request 对象
+    
+    Returns:
+        客户端 IP 地址
+    """
+    # 优先从 X-Forwarded-For 获取（考虑代理情况）
+    forwarded_for = request.headers.get('X-Forwarded-For')
+    if forwarded_for:
+        # X-Forwarded-For 可能包含多个 IP，取第一个
+        return forwarded_for.split(',')[0].strip()
+    
+    # 其次从 X-Real-IP 获取
+    real_ip = request.headers.get('X-Real-IP')
+    if real_ip:
+        return real_ip.strip()
+    
+    # 最后使用直连 IP
+    if request.client:
+        return request.client.host
+    
+    return 'unknown'
+
+
+async def verify_api_key(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    """
+    验证 Bearer Token 并返回用户标识
+    如果配置了 API_KEYS，则必须提供正确的 Bearer Token
+    
+    Args:
+        authorization: 从请求头 Authorization 中获取的值（格式：Bearer <token>）
+    
+    Returns:
+        用户标识字符串，如果未启用鉴权则返回 None
+    
+    Raises:
+        HTTPException: Token 验证失败时抛出 401 或 403 错误
+    """
+    # 如果没有配置任何 API_KEYS，则不进行鉴权
+    if not API_KEYS:
+        return None
+    
+    # 如果配置了 API_KEYS，则必须提供 Authorization header
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="缺少认证信息，请在请求头中提供 Authorization: Bearer <token>"
+        )
+    
+    # 检查格式是否为 Bearer token
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != 'bearer':
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization 格式错误，应为: Bearer <token>"
+        )
+    
+    token = parts[1]
+    
+    # 检查 token 是否有效
+    user_id = API_KEYS.get(token)
+    if not user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Token 无效"
+        )
+    
+    return user_id
 
 
 def get_lock_for_md5(md5: str) -> FileLock:
@@ -325,6 +444,8 @@ def _process_pdf_task(
     
     try:
         with lock:
+            pdf_pages = get_pdf_page_count(temp_pdf_path)
+
             # 创建基于 MD5 的输入目录
             input_dir = os.path.join(WORKSPACE_INPUT, md5)
             os.makedirs(input_dir, exist_ok=True)
@@ -442,7 +563,11 @@ async def root():
 
 
 @app.post("/mineru", response_model=MinerUResponse)
-async def mineru_endpoint(body: MinerURequest, request: Request):
+async def mineru_endpoint(
+    body: MinerURequest, 
+    request: Request,
+    api_key: Optional[str] = Depends(verify_api_key)
+):
     """
     MinerU PDF 转 Markdown 接口
     
@@ -455,6 +580,11 @@ async def mineru_endpoint(body: MinerURequest, request: Request):
     2. 调用 mineru 处理 PDF
     3. 返回输出文件的下载链接
     """
+    # 获取客户端 IP
+    client_ip = get_client_ip(request)
+    user_info = f"User: {api_key}" if api_key else "No Auth"
+    print(f"[API Request] /mineru - {user_info}, IP: {client_ip}")
+    
     # 获取请求的 base_url
     base_url = DOWNLOAD_BASE_URL or str(request.base_url).rstrip('/')
     
@@ -515,7 +645,8 @@ async def file_mineru_endpoint(
     backend: Optional[str] = Form(None, description="MinerU 后端类型"),
     lang: Optional[str] = Form(None, description="文档语言"),
     formula: Optional[bool] = Form(None, description="是否启用公式解析"),
-    table: Optional[bool] = Form(None, description="是否启用表格解析")
+    table: Optional[bool] = Form(None, description="是否启用表格解析"),
+    api_key: Optional[str] = Depends(verify_api_key)
 ):
     """
     通过文件上传方式处理 PDF
@@ -525,6 +656,11 @@ async def file_mineru_endpoint(
     2. 调用 mineru 处理 PDF
     3. 返回输出文件的下载链接
     """
+    # 获取客户端 IP
+    client_ip = get_client_ip(request)
+    user_info = f"User: {api_key}" if api_key else "No Auth"
+    print(f"[API Request] /file_mineru - {user_info}, IP: {client_ip}, File: {file.filename}")
+    
     base_url = DOWNLOAD_BASE_URL or str(request.base_url).rstrip('/')
     
     # 验证文件类型
