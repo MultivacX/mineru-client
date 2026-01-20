@@ -1,0 +1,3 @@
+workspace/input/
+workspace/output/
+uvicorn.log
