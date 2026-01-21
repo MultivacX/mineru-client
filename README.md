@@ -23,7 +23,9 @@ conda init --all
 
 conda create -n mineru-client --clone base --offline
 conda activate mineru-client
-pip install mineru fastapi uvicorn starlette pydantic pydantic_core filelock fitz frontend tools -i  http://10.104.7.78:8008/simple --trusted-host=10.104.7.78
+pip uninstall fitz
+pip uninstall PyMuPDF
+pip install mineru fastapi uvicorn starlette pydantic pydantic_core filelock PyMuPDF frontend tools -i  http://10.104.7.78:8008/simple --trusted-host=10.104.7.78
 ```
 
 
