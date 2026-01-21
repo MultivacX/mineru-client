@@ -23,7 +23,7 @@ conda init --all
 
 conda create -n mineru-client --clone base --offline
 conda activate mineru-client
-pip install mineru fastapi uvicorn starlette pydantic pydantic_core filelock fitz frontend tools -i  http://10.104.7.78:8008/simple --trusted-host=10.104.7.78
+pip install mineru fastapi uvicorn starlette pydantic pydantic_core filelock fitz frontend tools tabulate -i  http://10.104.7.78:8008/simple --trusted-host=10.104.7.78
 ```
 
 
@@ -204,3 +204,65 @@ curl -X POST "http://localhost:8081/mineru" \
      "table": true
    }'
 ```
+
+## 数据库功能
+
+本服务集成了 SQLite 数据库，用于管理 API Keys 和记录使用日志。
+
+### 功能特性
+
+1. **API Key 管理**
+   - 从数据库读取和验证 API Keys
+   - 支持启用/禁用 API Keys
+   - 自动从环境变量迁移到数据库
+
+2. **使用日志记录**
+   - 记录每次 API 调用的详细信息
+   - 包括：PDF 页数、MD 字符数、IP 地址、是否使用缓存等
+   - 支持按用户、时间等维度查询统计
+
+### 数据库管理工具
+
+使用 `manage_db.py` 脚本管理数据库：
+
+```sh
+# 列出所有 API Keys
+python manage_db.py list
+
+# 添加新的 API Key（自动生成）
+python manage_db.py add user1 -d "测试用户"
+
+# 添加新的 API Key（自定义）
+python manage_db.py add user2 -k "my_custom_key_123" -d "自定义密钥"
+
+# 删除 API Key
+python manage_db.py delete 1
+
+# 启用/禁用 API Key
+python manage_db.py toggle 2
+
+# 查看使用统计
+python manage_db.py stats
+
+# 查看特定用户的使用统计
+python manage_db.py stats -u user1
+```
+
+### Kylin Linux 安装 SQLite
+
+在 Kylin Linux Advanced Server V10 上安装 SQLite：
+
+```sh
+# 方法1: 使用 yum（推荐）
+sudo yum install sqlite sqlite-devel
+
+# 方法2: 使用 dnf
+sudo dnf install sqlite sqlite-devel
+```
+
+**官方下载地址**：
+- SQLite 官网：https://www.sqlite.org/download.html
+- 源码包：https://www.sqlite.org/2025/sqlite-autoconf-3480000.tar.gz
+- 预编译二进制：https://www.sqlite.org/2025/sqlite-tools-linux-x64-3480000.zip
+
+详细说明请参考 [DATABASE_USAGE.md](DATABASE_USAGE.md)

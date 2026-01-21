@@ -11,6 +11,8 @@ import fitz  # PyMuPDF
 import asyncio
 import logging
 import traceback
+import sqlite3
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional, Literal, Dict
@@ -37,6 +39,9 @@ os.makedirs(WORKSPACE_OUTPUT, exist_ok=True)
 # 文件锁目录
 WORKSPACE_LOCKS = os.path.join(WORKSPACE_ROOT, 'locks')
 os.makedirs(WORKSPACE_LOCKS, exist_ok=True)
+
+# 数据库配置
+DB_PATH = os.path.join(WORKSPACE_ROOT, 'ocr_service.db')
 
 # mineru 配置
 MINERU_VLM_URL = os.environ.get('MINERU_VLM_URL', 'http://10.104.255.37:30010')
@@ -84,10 +89,90 @@ elif os.environ.get('OCR_API_KEY', None):
 executor: Optional[ThreadPoolExecutor] = None
 
 
+def init_database():
+    """初始化数据库，创建表结构"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 创建 API Keys 表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_key TEXT UNIQUE NOT NULL,
+            user_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active INTEGER DEFAULT 1,
+            description TEXT
+        )
+    ''')
+    
+    # 创建使用日志表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS usage_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            md5 TEXT NOT NULL,
+            api_key TEXT,
+            user_id TEXT,
+            ip_address TEXT,
+            endpoint TEXT NOT NULL,
+            filename TEXT,
+            pdf_pages INTEGER,
+            md_chars INTEGER,
+            is_cached INTEGER DEFAULT 0,
+            success INTEGER DEFAULT 1,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # 创建索引以提高查询性能
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_api_key ON api_keys(api_key)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_usage_md5 ON usage_logs(md5)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_usage_api_key ON usage_logs(api_key)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage_logs(created_at)')
+    
+    conn.commit()
+    conn.close()
+    print(f"[数据库] 数据库初始化完成: {DB_PATH}")
+
+
+def migrate_api_keys_from_env():
+    """从环境变量迁移 API Keys 到数据库（仅在数据库为空时执行）"""
+    if not API_KEYS:
+        return
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 检查是否已有数据
+    cursor.execute('SELECT COUNT(*) FROM api_keys')
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        # 迁移环境变量中的 API Keys
+        for api_key, user_id in API_KEYS.items():
+            try:
+                cursor.execute(
+                    'INSERT INTO api_keys (api_key, user_id, description) VALUES (?, ?, ?)',
+                    (api_key, user_id, '从环境变量迁移')
+                )
+                print(f"[数据库] 已迁移 API Key: {user_id}")
+            except sqlite3.IntegrityError:
+                # Key 已存在，跳过
+                pass
+        conn.commit()
+    
+    conn.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global executor
+    # 初始化数据库
+    init_database()
+    # 迁移环境变量中的 API Keys（如果有）
+    migrate_api_keys_from_env()
     # 启动时创建线程池
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     print(f"[启动] 线程池已创建，最大并发数: {MAX_WORKERS}")
@@ -247,7 +332,7 @@ def get_client_ip(request: Request) -> str:
 async def verify_api_key(authorization: Optional[str] = Header(None)) -> Optional[str]:
     """
     验证 Bearer Token 并返回用户标识
-    如果配置了 API_KEYS，则必须提供正确的 Bearer Token
+    从数据库中查询 API Key，如果数据库为空则不进行鉴权
     
     Args:
         authorization: 从请求头 Authorization 中获取的值（格式：Bearer <token>）
@@ -258,8 +343,15 @@ async def verify_api_key(authorization: Optional[str] = Header(None)) -> Optiona
     Raises:
         HTTPException: Token 验证失败时抛出 401 或 403 错误
     """
+    # 检查数据库中是否有 API Keys
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM api_keys WHERE is_active = 1')
+    count = cursor.fetchone()[0]
+    conn.close()
+    
     # 如果没有配置任何 API_KEYS，则不进行鉴权
-    if not API_KEYS:
+    if count == 0:
         return None
     
     # 如果配置了 API_KEYS，则必须提供 Authorization header
@@ -279,21 +371,79 @@ async def verify_api_key(authorization: Optional[str] = Header(None)) -> Optiona
     
     token = parts[1]
     
-    # 检查 token 是否有效
-    user_id = API_KEYS.get(token)
-    if not user_id:
+    # 从数据库查询 token 是否有效
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT user_id FROM api_keys WHERE api_key = ? AND is_active = 1',
+        (token,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
         raise HTTPException(
             status_code=403,
             detail="Token 无效"
         )
     
-    return user_id
+    return result[0]  # 返回 user_id
 
 
 def get_lock_for_md5(md5: str) -> FileLock:
     """为指定的 MD5 获取文件锁"""
     lock_file = os.path.join(WORKSPACE_LOCKS, f"{md5}.lock")
     return FileLock(lock_file, timeout=300)  # 5分钟超时
+
+
+def log_usage(
+    md5: str,
+    api_key: Optional[str],
+    user_id: Optional[str],
+    ip_address: str,
+    endpoint: str,
+    filename: str,
+    pdf_pages: int,
+    md_chars: int,
+    is_cached: bool,
+    success: bool = True,
+    error_message: Optional[str] = None
+):
+    """
+    记录 API 使用日志到数据库
+    
+    Args:
+        md5: 文件 MD5
+        api_key: API Key（如果有）
+        user_id: 用户 ID（如果有）
+        ip_address: 客户端 IP 地址
+        endpoint: 调用的端点（/mineru 或 /file_mineru）
+        filename: 原始文件名
+        pdf_pages: PDF 页数
+        md_chars: Markdown 文件字符数
+        is_cached: 是否使用了缓存文件
+        success: 是否成功
+        error_message: 错误信息（如果失败）
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO usage_logs 
+            (md5, api_key, user_id, ip_address, endpoint, filename, 
+             pdf_pages, md_chars, is_cached, success, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            md5, api_key, user_id, ip_address, endpoint, filename,
+            pdf_pages, md_chars, 1 if is_cached else 0, 1 if success else 0, error_message
+        ))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"[日志] 已记录使用日志 - MD5: {md5}, 用户: {user_id}, 端点: {endpoint}, 缓存: {is_cached}")
+    except Exception as e:
+        logger.error(f"[日志] 记录使用日志失败: {str(e)}", exc_info=True)
 
 
 def save_original_filename(input_dir: str, original_filename: str):
@@ -473,7 +623,7 @@ def _process_pdf_task(
     filename: str, 
     base_url: str,
     mineru_params: MinerUCommandParams
-) -> MinerUResponse:
+) -> tuple[MinerUResponse, int, int, bool]:
     """
     核心处理逻辑（带并发保护）：
     1. 计算 MD5
@@ -488,6 +638,9 @@ def _process_pdf_task(
         filename: 原始文件名（用于记录）
         base_url: 下载基础 URL
         mineru_params: MinerU 命令参数（注意：path 和 output 会被重新设置）
+    
+    Returns:
+        (response, pdf_pages, md_chars, is_cached): 响应对象、PDF页数、MD字符数、是否使用缓存
     """
     # 计算 MD5
     md5 = calculate_file_md5(temp_pdf_path)
@@ -531,6 +684,7 @@ def _process_pdf_task(
                 files = get_output_files(output_dir)
                 download_urls = generate_download_urls(md5, files, base_url)
                 md_content = read_md_content(output_dir, md5)
+                md_chars = len(md_content) if md_content else 0
                 
                 # 获取原始文件名用于日志
                 original_filename = get_original_filename(input_dir) or filename
@@ -547,7 +701,7 @@ def _process_pdf_task(
                 # 统一使用 md5.md 作为动态字段名
                 if md_content:
                     setattr(response, f"{md5}.md", md_content)
-                return response
+                return response, pdf_pages, md_chars, True
             
             # 创建输出目录
             os.makedirs(output_dir, exist_ok=True)
@@ -561,18 +715,20 @@ def _process_pdf_task(
             success, message = run_mineru(mineru_params)
             
             if not success:
-                return MinerUResponse(
+                response = MinerUResponse(
                     success=False,
                     message=message,
                     md5=md5,
                     input_path=input_pdf_path,
                     output_path=output_dir
                 )
+                return response, pdf_pages, 0, False
             
             # 获取输出文件列表
             files = get_output_files(output_dir)
             download_urls = generate_download_urls(md5, files, base_url)
             md_content = read_md_content(output_dir, md5)
+            md_chars = len(md_content) if md_content else 0
             
             response = MinerUResponse(
                 success=True,
@@ -586,7 +742,7 @@ def _process_pdf_task(
             # 统一使用 md5.md 作为动态字段名
             if md_content:
                 setattr(response, f"{md5}.md", md_content)
-            return response
+            return response, pdf_pages, md_chars, False
             
     except Timeout:
         # 清理临时文件
@@ -703,7 +859,7 @@ async def mineru_endpoint(
         # 使用线程池异步执行处理任务
         logger.info(f"提交处理任务到线程池 - 文件: {filename}, IP: {client_ip}")
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
+        result_tuple = await loop.run_in_executor(
             executor,
             _process_pdf_task,
             temp_pdf_path,
@@ -711,6 +867,33 @@ async def mineru_endpoint(
             base_url,
             mineru_params
         )
+        
+        # 解包结果
+        result, pdf_pages, md_chars, is_cached = result_tuple
+        
+        # 记录使用日志
+        # 从 Authorization header 中提取原始 token（如果有）
+        authorization = request.headers.get('Authorization')
+        original_token = None
+        if authorization:
+            parts = authorization.split()
+            if len(parts) == 2 and parts[0].lower() == 'bearer':
+                original_token = parts[1]
+        
+        log_usage(
+            md5=result.md5,
+            api_key=original_token,
+            user_id=api_key,
+            ip_address=client_ip,
+            endpoint="/mineru",
+            filename=filename,
+            pdf_pages=pdf_pages,
+            md_chars=md_chars,
+            is_cached=is_cached,
+            success=result.success,
+            error_message=None if result.success else result.message
+        )
+        
         logger.info(f"处理任务完成 - 文件: {filename}, MD5: {result.md5}, 成功: {result.success}, IP: {client_ip}")
         return result
     except HTTPException:
@@ -793,7 +976,7 @@ async def file_mineru_endpoint(
         # 使用线程池异步执行处理任务
         logger.info(f"提交处理任务到线程池 - 文件: {filename}, IP: {client_ip}")
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
+        result_tuple = await loop.run_in_executor(
             executor,
             _process_pdf_task,
             temp_pdf_path,
@@ -801,6 +984,33 @@ async def file_mineru_endpoint(
             base_url,
             mineru_params
         )
+        
+        # 解包结果
+        result, pdf_pages, md_chars, is_cached = result_tuple
+        
+        # 记录使用日志
+        # 从 Authorization header 中提取原始 token（如果有）
+        authorization = request.headers.get('Authorization')
+        original_token = None
+        if authorization:
+            parts = authorization.split()
+            if len(parts) == 2 and parts[0].lower() == 'bearer':
+                original_token = parts[1]
+        
+        log_usage(
+            md5=result.md5,
+            api_key=original_token,
+            user_id=api_key,
+            ip_address=client_ip,
+            endpoint="/file_mineru",
+            filename=filename,
+            pdf_pages=pdf_pages,
+            md_chars=md_chars,
+            is_cached=is_cached,
+            success=result.success,
+            error_message=None if result.success else result.message
+        )
+        
         logger.info(f"处理任务完成 - 文件: {filename}, MD5: {result.md5}, 成功: {result.success}, IP: {client_ip}")
         return result
     except HTTPException:
