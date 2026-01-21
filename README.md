@@ -40,6 +40,10 @@ conda activate mineru-client
 pkill -f "uvicorn services.apis_ocr"
 sleep 2
 nohup uvicorn services.apis_ocr:app --host 0.0.0.0 --port 8081 > uvicorn.log 2>&1 &
+
+pkill -f "uvicorn services.apis_forward"
+sleep 2
+nohup uvicorn services.apis_ocr:app --host 0.0.0.0 --port 8081
 ```
 
 5. 在服务器上测试本地文件，返回值见 workspace/公开-设备买卖合同.json
