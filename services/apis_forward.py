@@ -395,17 +395,17 @@ async def file_mineru_endpoint(
         raise HTTPException(status_code=500, detail=f"处理请求失败: {str(e)}")
 
 
-@app.get("/files/{path:path}")
+@app.api_route("/files/{path:path}", methods=["GET", "POST"])
 async def download_file(path: str, request: Request):
     """
-    文件下载转发接口
+    文件下载转发接口（支持 GET 和 POST）
     
     将文件下载请求转发到后端 MinerU 服务
     示例: /files/output/6185e4983f3b150745fd25d09cf15e41/6185e4983f3b150745fd25d09cf15e41/vlm/6185e4983f3b150745fd25d09cf15e41_model.json
     将转发到: http://10.104.255.37:30010/files/output/.../...
     """
     client_ip = get_client_ip(request)
-    logger.info(f"[API /files] IP: {client_ip}, Path: {path}")
+    logger.info(f"[API /files] Method: {request.method}, IP: {client_ip}, Path: {path}")
     
     try:
         # 构建后端文件下载 URL
@@ -422,13 +422,21 @@ async def download_file(path: str, request: Request):
         if request.headers.get('Authorization'):
             headers['Authorization'] = request.headers.get('Authorization')
         
-        # 发送请求到后端
-        response = requests.get(
-            backend_url,
-            headers=headers,
-            stream=True,
-            timeout=300
-        )
+        # 根据请求方法选择对应的 requests 方法
+        if request.method == "POST":
+            response = requests.post(
+                backend_url,
+                headers=headers,
+                stream=True,
+                timeout=300
+            )
+        else:
+            response = requests.get(
+                backend_url,
+                headers=headers,
+                stream=True,
+                timeout=300
+            )
         response.raise_for_status()
         
         # 提取文件名
