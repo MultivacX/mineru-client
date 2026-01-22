@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Dict
 from urllib.parse import urlparse, unquote
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Header, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -391,6 +392,72 @@ async def file_mineru_endpoint(
         raise
     except Exception as e:
         logger.error(f"[API /file_mineru] 处理失败, IP: {client_ip}, 文件: {file.filename}, 错误: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"处理请求失败: {str(e)}")
+
+
+@app.get("/files/{path:path}")
+async def download_file(path: str, request: Request):
+    """
+    文件下载转发接口
+    
+    将文件下载请求转发到后端 MinerU 服务
+    示例: /files/output/6185e4983f3b150745fd25d09cf15e41/6185e4983f3b150745fd25d09cf15e41/vlm/6185e4983f3b150745fd25d09cf15e41_model.json
+    将转发到: http://10.104.255.37:30010/files/output/.../...
+    """
+    client_ip = get_client_ip(request)
+    logger.info(f"[API /files] IP: {client_ip}, Path: {path}")
+    
+    try:
+        # 构建后端文件下载 URL
+        backend_url = f"{MINERU_VLM_URL.rstrip('/')}/files/{path}"
+        logger.info(f"转发文件下载请求到: {backend_url}")
+        
+        # 准备请求头（透传 IP）
+        headers = {
+            'X-Forwarded-For': client_ip,
+            'X-Real-IP': client_ip
+        }
+        
+        # 转发 Authorization 头（如果有）
+        if request.headers.get('Authorization'):
+            headers['Authorization'] = request.headers.get('Authorization')
+        
+        # 发送请求到后端
+        response = requests.get(
+            backend_url,
+            headers=headers,
+            stream=True,
+            timeout=300
+        )
+        response.raise_for_status()
+        
+        # 提取文件名
+        filename = os.path.basename(path)
+        content_type = response.headers.get('Content-Type', 'application/octet-stream')
+        
+        # 流式返回文件内容
+        def iterfile():
+            try:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            finally:
+                response.close()
+        
+        logger.info(f"文件下载成功: {filename}")
+        return StreamingResponse(
+            iterfile(),
+            media_type=content_type,
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"'
+            }
+        )
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[API /files] 下载失败, IP: {client_ip}, Path: {path}, 错误: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"文件下载失败: {str(e)}")
+    except Exception as e:
+        logger.error(f"[API /files] 处理失败, IP: {client_ip}, Path: {path}, 错误: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"处理请求失败: {str(e)}")
 
 
