@@ -400,7 +400,7 @@ async def download_file(path: str, request: Request):
     """
     文件下载转发接口（支持 GET 和 POST）
     
-    将文件下载请求转发到后端 MinerU 服务
+    将文件下载请求转发到后端 MinerU 服务（统一使用 GET 方法）
     示例: /files/output/6185e4983f3b150745fd25d09cf15e41/6185e4983f3b150745fd25d09cf15e41/vlm/6185e4983f3b150745fd25d09cf15e41_model.json
     将转发到: http://10.104.255.37:30010/files/output/.../...
     """
@@ -410,7 +410,7 @@ async def download_file(path: str, request: Request):
     try:
         # 构建后端文件下载 URL
         backend_url = f"{MINERU_VLM_URL.rstrip('/')}/files/{path}"
-        logger.info(f"转发文件下载请求到: {backend_url}")
+        logger.info(f"转发文件下载请求到: {backend_url} (使用 GET 方法)")
         
         # 准备请求头（透传 IP）
         headers = {
@@ -422,21 +422,13 @@ async def download_file(path: str, request: Request):
         if request.headers.get('Authorization'):
             headers['Authorization'] = request.headers.get('Authorization')
         
-        # 根据请求方法选择对应的 requests 方法
-        if request.method == "POST":
-            response = requests.post(
-                backend_url,
-                headers=headers,
-                stream=True,
-                timeout=300
-            )
-        else:
-            response = requests.get(
-                backend_url,
-                headers=headers,
-                stream=True,
-                timeout=300
-            )
+        # 统一使用 GET 方法访问后端文件下载接口
+        response = requests.get(
+            backend_url,
+            headers=headers,
+            stream=True,
+            timeout=300
+        )
         response.raise_for_status()
         
         # 提取文件名
